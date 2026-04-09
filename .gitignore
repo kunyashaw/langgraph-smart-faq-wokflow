@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+*.egg-info/
+*.pyc
+
+# Virtual environments
+.venv/
+.venv
+
+# Environment variables (secrets)
+.env
+
+# Lock file (optional - uncomment if you don't want to track it)
+# uv.lock
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Testing
+.pytest_cache/
+.mypy_cache/
