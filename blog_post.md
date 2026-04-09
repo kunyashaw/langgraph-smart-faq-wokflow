@@ -1,34 +1,32 @@
 # LangGraph 工作流项目从零到运行
 
-手把手记录一个 LangGraph + MiniMax 的智能问答工作流项目，支持多轮对话、路由分发、Agent 调用和 LangSmith 追踪。
+从零搭一个 LangGraph + MiniMax 的智能问答项目，支持多轮对话、路由分发、Agent 调用，带 LangSmith 追踪。踩了不少坑，记录下来给有需要的人。
+
+## 背景
+
+想做一个人入口：用户问啥答啥，但内部自动分流。通用问题走通用问答 Agent，代码相关走代码处理 Agent。最关键的是——要支持多轮对话，用户能追问、补充代码、深入聊。
+
+最后折腾出来的方案：用 LangGraph 搭路由 + Agent 组合的工作流，接 MiniMax API，配合 LangSmith 做调用链追踪，State 里用 `add_messages` reducer 自动累积对话历史。
 
 ---
 
-## 项目背景
+## 开工前的准备
 
-想做一个智能问答入口：根据用户输入的内容，自动判断该走通用问答还是代码处理。重要的是要支持多轮对话——用户可以追问、补充代码、继续深入。
-
-最终方案：LangGraph 搭路由 + Agent 组合的工作流，接 MiniMax API，配合 LangSmith 做调用追踪，State 中用 `add_messages` reducer 自动累积对话历史。
-
----
-
-## 环境准备
-
-### 1. 初始化项目
+### 初始化项目
 
 ```bash
 mkdir demos && cd demos
 uv init
 ```
 
-### 2. 安装依赖
+### 装依赖
 
 ```bash
 uv add langchain-openai langgraph python-dotenv
 uv add langchain-core langchain-community
 ```
 
-`pyproject.toml` 最终长这样：
+`pyproject.toml` 最终内容：
 
 ```toml
 [project]
@@ -42,7 +40,7 @@ dependencies = [
 ]
 ```
 
-### 3. 配置 API Key
+### 配置 API Key
 
 根目录新建 `.env`：
 
@@ -71,15 +69,10 @@ demos/
 │   └── search_tools.py  # 搜索工具
 ├── workflow/            # 工作流
 │   ├── nodes/           # 节点实现
-│   │   └── simple_assistant_nodes.py
-│   ├── graph/            # 图定义
-│   │   └── simple_assistant_graph.py
+│   ├── graph/           # 图定义
 │   ├── routes/          # 路由逻辑
-│   │   └── simple_assistant_routes.py
 │   ├── states/          # 状态定义
-│   │   └── simple_assistant_state.py
 │   └── simple_assistant/
-│       └── __init__.py   # facade
 └── run_workflow.py      # 入口脚本
 ```
 
@@ -109,7 +102,7 @@ def build_llm() -> ChatOpenAI:
 
 ### LangSmith 配置
 
-`core/tracing.py` 处理链路追踪：
+`core/tracing.py` 处理调用链追踪：
 
 ```python
 import os
@@ -148,17 +141,17 @@ def extend_run_config(config, run_name=None, tags=None, metadata=None):
 
 ### 通用问答 Agent
 
-`agents/prompt_agent.py`，支持自动识别计算和搜索意图并调用对应工具。这里不展开完整代码，核心是 `PromptAgent` 类提供 `reply()` 方法，输入问题字符串返回 dict。
+`agents/prompt_agent.py`：`PromptAgent` 类提供 `reply()` 方法，输入问题字符串返回 dict。核心能力是根据用户输入自动判断是否需要调用计算或搜索工具。
 
 ### 代码处理 Agent
 
-`agents/code_agent.py`，专注于代码排错和修复建议。`CodeAgent` 类提供 `reply()` 和 `debug_reply()` 方法。
+`agents/code_agent.py`：`CodeAgent` 类提供 `reply()` 和 `debug_reply()` 方法，分别处理普通代码问答和带报错信息的代码调试场景。
 
 ---
 
 ## 工作流设计
 
-### 状态定义（支持多轮对话）
+### State 定义（支持多轮对话的关键）
 
 `workflow/states/simple_assistant_state.py`：
 
@@ -182,7 +175,7 @@ class SimpleAssistantState(TypedDict):
     tool_route: str
 ```
 
-关键点：`messages: Annotated[list, add_messages]` 让新消息自动追加到列表，而不是覆盖。
+重点在 `messages: Annotated[list, add_messages]`——这行让新消息自动追加到列表，而不是覆盖。`add_messages` 是 LangGraph 内置的 reducer 函数，专门处理消息合并。
 
 ### 路由逻辑
 
@@ -222,6 +215,8 @@ def route_after_router(state: SimpleAssistantState) -> Literal["prompt_agent_nod
         return "code_agent_node"
     return "prompt_agent_node"
 ```
+
+路由逻辑：先看 state 里有没有 code 或 error_message，有的话直接走 code_agent；没有的话从 messages 里提取最新用户输入，命中关键词就走 code_agent，否则走 prompt_agent。
 
 ### 节点实现
 
@@ -320,6 +315,8 @@ def code_agent_node(state: SimpleAssistantState, *, config: RunnableConfig) -> d
     }
 ```
 
+节点从 state 取 messages 列表，拿到最后一条 HumanMessage 传给 Agent 处理。返回值里的 `messages` 字段会被 LangGraph 自动合并到历史里。
+
 ### 图构建
 
 `workflow/graph/simple_assistant_graph.py`：
@@ -381,11 +378,13 @@ def run_simple_assistant(
     return app.invoke(state, config=run_config)
 ```
 
+流程：START → router_node 做分流 → 根据 intent 走 prompt_agent_node 或 code_agent_node → END。
+
 ---
 
 ## 入口脚本
 
-`run_workflow.py`，支持单轮和多轮对话：
+`run_workflow.py`：
 
 ```python
 import argparse
@@ -466,19 +465,23 @@ if __name__ == "__main__":
     main()
 ```
 
+支持两种模式：
+- `--user-input`：单轮问答
+- 不带参数：进入多轮对话循环
+
 ---
 
-## 运行方式
+## 怎么跑
 
-### 查看工作流图
+### 看工作流图
 
 ```bash
 uv run python run_workflow.py --show-graph
 ```
 
-会输出 Mermaid 格式的图结构，复制到 [mermaid.live](https://mermaid.live) 可以直接渲染。
+输出 Mermaid 格式的图结构，复制到 [mermaid.live](https://mermaid.live) 直接渲染。
 
-### 单轮对话
+### 单轮问答
 
 ```bash
 uv run python run_workflow.py --user-input "你好，介绍一下自己"
@@ -490,7 +493,7 @@ uv run python run_workflow.py --user-input "你好，介绍一下自己"
 uv run python run_workflow.py
 ```
 
-进入多轮模式后，可以连续对话：
+示例：
 
 ```
 Simple Assistant Workflow CLI (多轮对话模式)
@@ -509,25 +512,20 @@ Simple Assistant Workflow CLI (多轮对话模式)
 
 ---
 
-## 多轮对话实现原理
+## 多轮对话怎么实现的
 
-关键在于 State 中的 `messages: Annotated[list, add_messages]`：
+核心在 State 里的 `messages: Annotated[list, add_messages]`。
 
-- `add_messages` 是一个 reducer 函数，告诉 LangGraph 如何合并同一字段的多次更新
-- 每次新增消息时，LangGraph 自动把新消息 append 到列表，而不是覆盖整个列表
-- 这样 `app.invoke(state)` 会保留之前的所有消息
+`add_messages` 是 LangGraph 内置的 reducer 函数，作用是告诉 LangGraph：同一字段多次更新时怎么处理合并。默认行为是覆盖，但指定了 reducer 后，LangGraph 会把新消息 append 到列表，而不是整个列表替换掉。
 
-节点的返回值也需要返回 `messages` 字段：
+所以流程是这样的：
+1. 用户输入 `你好` → messages = [HumanMessage(content="你好")]
+2. 节点返回 `{"messages": [AIMessage(content="你好，有什么可以帮你的？")]}`
+3. LangGraph 自动合并 → messages = [HumanMessage(...), AIMessage(...)]
+4. 用户追问 `你能做什么` → messages = [HumanMessage(...), AIMessage(...), HumanMessage(content="你能做什么")]
+5. 节点看到的是完整历史，可以基于之前的上下文回答
 
-```python
-return {
-    "messages": [AIMessage(content=result["answer"])],
-    "agent_name": ...,
-    ...
-}
-```
-
-LangGraph 会自动把这条 AI 消息合并到历史中。
+关键点：节点返回值必须包含 `messages` 字段，LangGraph 才会触发合并逻辑。
 
 ---
 
@@ -563,10 +561,9 @@ demos/
 │   └── simple_assistant/
 │       └── __init__.py
 ├── .env
+├── .gitignore
 ├── pyproject.toml
 └── run_workflow.py
 ```
 
----
-
-*项目代码本地调试通过，依赖版本见 pyproject.toml*
+代码已开源：[kunyashaw/langgraph-smart-faq-wokflow](https://github.com/kunyashaw/langgraph-smart-faq-wokflow)
